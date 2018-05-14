@@ -1,0 +1,253 @@
+---
+title: "CF for Credit Card spending"
+author: "Advanced Analytics BICC - Nguyen Minh Thanh"
+date: "30 October 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(RODBC)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(reshape2)
+library(recommenderlab)
+library(faxtoextra)
+library(purrr)
+#load data CC spending
+ch <- odbcConnect("thanh", uid = "sa", pwd = "123")
+raw_data <- sqlQuery(ch, "SELECT target_id, trans_date, trans_amount, mcc_category
+                     FROM [BA].[dbo].[CREDIT_CARD_TRANSACTION_SUCCESSFUL_MASTER]
+                     WHERE TRANS_DATE <= '2017-07-30'")
+
+test_data <- sqlQuery(ch, "SELECT target_id, mcc_category
+                     FROM [BA].[dbo].[CREDIT_CARD_TRANSACTION_SUCCESSFUL_MASTER]
+                     WHERE TRANS_DATE > '2017-07-30'")
+#fix raw data
+raw_data$trans_date <- raw_data$trans_date %>% as.Date()
+raw_data$mcc_category[is.na(raw_data$mcc_category) == T] <- "Others"
+
+raw_data$mcc_category <- gsub(" ", "", raw_data$mcc_category) 
+raw_data$mcc_category <- gsub("[[:punct:]]", "", raw_data$mcc_category) 
+raw_data$mcc_category <- raw_data$mcc_category %>% as.factor()
+raw_data$target_id <- raw_data$target_id %>% as.factor
+save(raw_data, file = "./Data/raw_data.Rda")
+
+#test data
+test_data  <- test_data %>% 
+  distinct()
+
+test_data$mcc_category <- gsub(" ", "", test_data$mcc_category) 
+test_data$mcc_category <- gsub("[[:punct:]]", "", test_data$mcc_category) 
+test_data$mcc_category <- test_data$mcc_category %>% as.factor()
+test_data$target_id <- test_data$target_id %>% as.factor
+test_data$status <- as.factor("Yes")
+save(test_data, file = "./Data/test_data.Rda")
+```
+
+# Prepare data for CF
+
+```{r, eval=F}
+rm(list = ls())
+load(file = "./Data/raw_data.Rda")
+score_credit_card <- raw_data %>% 
+  group_by(target_id, mcc_category) %>% 
+  summarise(first_date = min(trans_date),
+            last_date = last(trans_date),
+            total_amt = sum(trans_amount),
+            total_no = n()) %>% 
+  as.data.frame()
+
+score_credit_card  <- score_credit_card %>% 
+  mutate(recency = difftime(as.Date("2017-07-30"), last_date, units = "weeks") %>% as.numeric(),
+         tenure = difftime(last_date, first_date, units = "weeks")%>% as.numeric())
+
+score_credit_card$tenure <- (score_credit_card$tenure %>% floor()) + 1
+score_credit_card$recency <- (score_credit_card$recency %>% floor()) + 1
+
+score_credit_card <- score_credit_card %>% 
+  select(-first_date, -last_date)
+
+score_credit_card <- score_credit_card %>% 
+  group_by(mcc_category) %>% 
+  mutate(trans_score = ntile(total_no, 10),
+         amt_score = ntile(total_amt, 10),
+         tenure_score = ntile(tenure, 10),
+         recency_score = ntile(recency, 10))
+
+# score_credit_card <- score_credit_card %>% 
+#   mutate(tenure_score = case_when(
+#     tenure_score == 1 ~ 10,
+#     tenure_score == 2 ~ 9,
+#     tenure_score == 3 ~ 8,
+#     tenure_score == 4 ~ 7,
+#     tenure_score == 5 ~ 6,
+#     tenure_score == 6 ~ 5,
+#     tenure_score == 7 ~ 4,
+#     tenure_score == 8 ~ 3,
+#     tenure_score == 9 ~ 2,
+#     tenure_score == 10 ~ 1
+#   ))
+
+score_credit_card <- score_credit_card %>%
+  mutate(recency_score = case_when(
+    recency_score == 1 ~ 10,
+    recency_score == 2 ~ 9,
+    recency_score == 3 ~ 8,
+    recency_score == 4 ~ 7,
+    recency_score == 5 ~ 6,
+    recency_score == 6 ~ 5,
+    recency_score == 7 ~ 4,
+    recency_score == 8 ~ 3,
+    recency_score == 9 ~ 2,
+    recency_score == 10 ~ 1
+  ))
+
+score_credit_card <- score_credit_card %>% 
+  mutate(score = (trans_score + amt_score + tenure_score + recency_score)/4)
+
+score_credit_card <- score_credit_card %>% as.data.frame()
+
+score_credit_card_long <- score_credit_card %>% 
+  select(target_id, mcc_category, score) %>% 
+  dcast(target_id ~ mcc_category)
+
+score_credit_card_long[is.na(score_credit_card_long)] <- 0
+save(score_credit_card_long, file = "./Data/score_credit_card_long.Rda")
+```
+
+# Load data and function for CF
+
+```{r, message=F, warning=F}
+rm(list = ls())
+load(file = "./Data/score_credit_card_long.Rda")
+load(file = "./Function/add_predictions_to_prediction_matrix.Rda")
+load(file = "./Function/cal_cor.Rda")
+load(file = "./Function/cal_cos.Rda")
+load(file = "./Function/calculate_predictions.Rda")
+load(file = "./Function/evaluate_cf.Rda")
+load(file = "./Function/find_similarities.Rda")
+load(file = "./Function/predict_cf.Rda")
+load(file = "./Function/rmse_function.Rda")
+```
+
+# Run CF
+
+```{r, eval=F}
+ratings_matrix <- Matrix(as.matrix(score_credit_card_long %>% select(-1)), sparse = TRUE) 
+
+items_to_predict <- 1:ncol(ratings_matrix)
+users <- 1:nrow(ratings_matrix)
+prediction_indices <- as.matrix(expand.grid(users,items_to_predict))
+recommender_result <- predict_cf(ratings_matrix, 
+                                 prediction_indices, 
+                                 alg_method = "ibcf", 
+                                 normalization = TRUE, 
+                                 similarity_metric = cal_cos, 
+                                 k = 300, 
+                                 make_positive_similarities = FALSE, 
+                                 rowchunk_size = 2000, 
+                                 columnchunk_size = 1000)
+
+recommender_result_final <- as.data.frame(as.matrix(recommender_result)) 
+recommender_result_final$target_id <- score_credit_card_long$target_id
+recommender_result_final <- recommender_result_final %>% 
+  melt(id.vars = "target_id")
+
+recommend_data <- left_join(recommender_result_final,
+                       score_credit_card_long %>% melt(id.vars = "target_id"),
+                       by = c("target_id", "variable"))
+
+recommend <- recommend_data %>% 
+  filter(value.y == 0) %>%
+  group_by(target_id) %>% 
+  arrange(desc(value.x)) %>% 
+  slice(1:3) %>% 
+  as.data.frame()
+save(recommend, file = "./Data/recommend.Rda")
+```
+
+# Lọc khách hàng tiềm năng
+
+```{r, eval=F}
+load(file = "./Data/raw_data.Rda")
+rfm_data <- raw_data %>% 
+  group_by(target_id) %>% 
+  summarise(first_date = min(trans_date),
+            last_date = last(trans_date),
+            total_amt = sum(trans_amount),
+            total_no = n()) %>% 
+  as.data.frame()
+
+rfm_data  <- rfm_data %>% 
+  mutate(recency = difftime(as.Date("2017-07-30"), last_date, units = "weeks") %>% as.numeric(),
+         tenure = difftime(last_date, first_date, units = "weeks")%>% as.numeric())
+
+rfm_data$tenure <- (rfm_data$tenure %>% floor()) + 1
+rfm_data$recency <- (rfm_data$recency %>% floor()) + 1
+
+rfm_data <- rfm_data %>% 
+  select(-first_date, -last_date)
+
+scale_data <- function(x) {
+  (x-min(x))/(max(x) - min(x))
+}
+
+scale_rfm_data <- map_df(rfm_data %>% select(-1), scale_data)
+set.seed(2412)
+keam_result <- kmeans(scale_rfm_data, 4, iter.max = 300)
+rfm_data$group <- keam_result$cluster
+
+rfm_data %>% 
+  group_by(group) %>% 
+  summarise(no_custoemr = n(),
+            mean_total_amt = mean(total_amt),
+            mean_total_no = mean(total_no),
+            mean_recency = mean(recency),
+            mean_tenure = mean(tenure)) %>% View
+save(rfm_data, file = "./Data/rfm_data.Rda")
+```
+
+
+# Recommend for Card OK
+
+```{r, message=F, warning=F}
+rm(list = ls())
+load(file = "./Data/recommend.Rda")
+# ch <- odbcConnect("thanh", uid = "sa", pwd = "123")
+# card_status <- sqlQuery(ch, "SELECT acnt_contract_id target_id, 1 value
+#                             FROM [RBD].[DAILY_RETAIL].[dbo].[CREDITCARD_20170731]
+#                             where production_status = 'Ready'
+#                             and contract_status = 'Account OK'
+#                             and card_status = 'Card OK'")
+# save(card_status, file = "./Data/card_status.Rda")
+load(file = "./Data/card_status.Rda")
+load(file = "./Data/rfm_data.Rda")
+load(file = "./Data/test_data.Rda")
+
+card_status$target_id  <- card_status$target_id %>% as.factor
+recommend_fix <- left_join(recommend, card_status) %>% 
+  filter(value == 1)
+recommend_fix_1 <- left_join(recommend_fix, rfm_data %>% select(target_id, group)) %>% 
+  filter(group %in% c(3,4))
+
+
+names(test_data)[2] <- "variable"
+calculate_cf <- left_join(recommend_fix_1, test_data)
+
+recommend_fix_1 %>% distinct(target_id) %>% count()
+
+calculate_cf %>% 
+  filter(status == "Yes") %>% 
+  distinct(target_id) %>% count
+```
+
+#Test 1: UBCF, normalisation = FALSE: 6.83%
+#Test 2: UBCF, normalisation = TRUE: 8.04%
+#Test 3: IBCF, normalisation = FALSE: 5.19%
+#Test 4: IBCF, normalisation = TRUE: 5.19%
+#Test 4: UBCF, đảo ngược prediction_indices, normalisation = TRUE, make_positive_similarities = TRUE: 8.5%
+#Test 5: UBCF, đảo ngược prediction_indices, normalisation = TRUE : 8.9%
+#Test 6: IBCF, đảo ngược prediction_indices, normalisation = TRUE : 8.05%
+#Test 7: UBCF, đảo ngược prediction_indices, normalisation = TRUE : 9.6%
+#Test 8: UBCF, đảo ngược prediction_indices, normalisation = TRUE + rfm lọc khách hàng: 10.27%
